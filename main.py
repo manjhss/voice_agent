@@ -1,13 +1,15 @@
-"""Record audio from the mic, save it as WAV, and inspect or play it on demand."""
+"""Record audio from the mic, save it as WAV, resample it, and play it on demand."""
 
 import wave
+from math import gcd
 from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
+from scipy.signal import resample_poly
 
 RECORDINGS_DIR = Path("recordings")
-DEFAULT_WAV = RECORDINGS_DIR / "recording.wav"
+RESAMPLED_DIR = Path("resampled")
 
 
 def ask(prompt: str, default) -> str:
@@ -25,6 +27,15 @@ def ask_int(prompt: str, default: int) -> int:
         except ValueError:
             pass
         print("Please enter a positive integer.")
+
+
+def ask_path(prompt: str, folder: Path) -> Path:
+    """Prompt for a file name (required) and return it inside the given folder."""
+    while True:
+        name = input(f"{prompt} (saved in {folder}/): ").strip()
+        if name:
+            return folder / Path(name)
+        print("File name can't be empty.")
 
 
 def record(rate: int, channels: int, duration: int) -> np.ndarray:
@@ -86,7 +97,7 @@ def record_flow() -> None:
     rate = ask_int("Sample rate (Hz)", 16_000)
     channels = ask_int("Channels", 1)
     duration = ask_int("Duration (seconds)", 5)
-    path = Path(ask("Save as", DEFAULT_WAV))
+    path = ask_path("Save as", RECORDINGS_DIR)
 
     audio = record(rate, channels, duration)
     print(f"Captured array -> shape: {audio.shape} | dtype: {audio.dtype}")
@@ -94,26 +105,90 @@ def record_flow() -> None:
     inspect_wav(path)
 
 
+def find_wav(name: str) -> Path | None:
+    """Look up a wav by name in recordings/ then resampled/."""
+    for folder in (RECORDINGS_DIR, RESAMPLED_DIR):
+        path = folder / name
+        if path.exists():
+            return path
+    return None
+
+
 def play_flow() -> None:
-    """Ask for playback configs (path, rate, channels), then play the file."""
-    path = Path(ask("WAV file to play", DEFAULT_WAV))
+    """Ask which file to play and its playback configs, then play it."""
+    path = None
+    while path is None:
+        name = input("WAV file to play (in recordings/ or resampled/): ").strip()
+        if not name:
+            print("File name can't be empty.")
+            continue
+        path = find_wav(name)
+        if path is None:
+            print(f"'{name}' not found in recordings/ or resampled/.")
     rate = ask_int("Sample rate (Hz)", 16_000)
     channels = ask_int("Channels", 1)
     play(path, rate, channels)
 
 
+def resample_flow() -> None:
+    """Pick an existing recording, resample it to a target rate, and compare both."""
+    files = sorted(RECORDINGS_DIR.glob("*.wav"))
+    if not files:
+        print("No recordings found in recordings/. Record something first.")
+        return
+    print("\nAvailable recordings:")
+    for f in files:
+        print(f"  - {f.name}")
+
+    path = None
+    while path is None:
+        name = input("Resample which file: ").strip()
+        if not name:
+            print("File name can't be empty.")
+            continue
+        candidate = RECORDINGS_DIR / name
+        if candidate.exists():
+            path = candidate
+        else:
+            print(f"'{name}' not found in recordings/.")
+    down_rate = ask_int(f"Resample to (Hz)", 16_000)
+
+    samples, meta = read_wav(path)
+    up_rate, channels = meta["sample_rate"], meta["channels"]
+    print(f"\nSource: {path.name} -> {up_rate} Hz, {channels} ch, "
+          f"{meta['frames']} frames")
+
+    # Changing only the WAV's sample-rate metadata would relabel the timeline
+    # (5 s of audio would claim to be 1.67 s) and make playback 3x too fast.
+    # Resampling actually recomputes the samples for the new rate.
+    g = gcd(up_rate, down_rate)  # exact for any rate pair, e.g. 48000 -> 16000
+    resampled = resample_poly(
+        samples.reshape(-1, channels), up=down_rate // g, down=up_rate // g, axis=0
+    )
+    resampled = np.clip(resampled, -32768, 32767).astype("int16")
+    down_path = RESAMPLED_DIR / f"{path.stem}_{down_rate}.wav"
+    save_wav(resampled, down_path, down_rate, channels)
+
+    # Compare both files: metadata + duration side by side.
+    for p in (path, down_path):
+        inspect_wav(p)
+
+
 def main() -> None:
-    """Show a menu and dispatch to the record or play flow until quit."""
+    """Show a menu and dispatch to a flow until quit."""
     RECORDINGS_DIR.mkdir(exist_ok=True)
+    RESAMPLED_DIR.mkdir(exist_ok=True)
     while True:
         print("\n=== Voice Agent ===")
-        print("1. Record  2. Play  3. Quit")
+        print("1. Record  2. Play  3. Resample  4. Quit")
         choice = input("Choose: ").strip()
         if choice == "1":
             record_flow()
         elif choice == "2":
             play_flow()
         elif choice == "3":
+            resample_flow()
+        elif choice == "4":
             break
         else:
             print("Invalid choice.")
