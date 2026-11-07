@@ -11,3 +11,6 @@ wheels/
 
 # Recordings
 *.wav
+
+# Local Whisper models
+models/
